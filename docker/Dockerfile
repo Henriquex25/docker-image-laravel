@@ -1,76 +1,90 @@
 ARG PHP_VERSION
-FROM php:${PHP_VERSION}
+FROM php:${PHP_VERSION:-8.3.2-fpm-bullseye}
+
+## Argumentos para sincronizar permissões entre host e container
+ARG WWWUSER=1000
+ARG WWWGROUP=1000
 
 ## Versão da Lib do Redis para PHP
-ARG REDIS_LIB_VERSION=6.0.2
+ARG REDIS_LIB_VERSION=6.2.0
 
 ## Versão do NODE
-ARG NODE_VERSION=21
+ARG NODE_VERSION=23
 
 ## Diretório da aplicação
 ARG APP_DIR=/var/www
 
-### apt-utils é um extensão de recursos do gerenciador de pacotes APT
+### Instalações básicas
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
     apt-utils \
-    supervisor
-
-# dependências recomendadas de desenvolvido para ambiente linux
-RUN apt-get update && apt-get install -y \
+    supervisor \
     zlib1g-dev \
     libzip-dev \
     unzip \
     libpng-dev \
     libpq-dev \
-    libxml2-dev
+    libxml2-dev \
+    libbrotli-dev \
+    default-mysql-client \
+    nginx \
+    nano \
+    git && \
+    rm -rf /var/lib/apt/lists/*
 
-# Instalando dependências do PHP
+# Instalando extensões do PHP
 RUN docker-php-ext-install mysqli pdo pdo_mysql session xml intl zip simplexml pcntl gd
 
-# habilita instalação do Redis
-RUN pecl install redis-${REDIS_LIB_VERSION} \
+# Redis e Swoole
+RUN pecl channel-update pecl.php.net \
+    && pecl install redis-${REDIS_LIB_VERSION} \
     && docker-php-ext-enable redis
 
-### Instalar e Habilitar o Swoole
-RUN pecl install swoole
-RUN docker-php-ext-enable swoole
-
-# Instalação do Node NPM
-RUN curl -sLS https://deb.nodesource.com/setup_$NODE_VERSION.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g npm
+# RUN pecl install swoole && docker-php-ext-enable swoole
 
 # Composer
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# Instalando mysql-client para que o pacite spatie laravel-backup tenha acesso ao mysqldump
-RUN apt update && apt-get install -y default-mysql-client
+### Configuração de usuário/grupo para sincronizar com o host
+RUN if [ ${WWWUSER} -ne 0 ]; then \
+    usermod -u ${WWWUSER} www-data && \
+    groupmod -g ${WWWGROUP} www-data; \
+    fi
 
-### Supervisor permite monitorar e controlar vários processos (LINUX)
-### Bastante utilizado para manter processos em Daemon, ou seja, executando em segundo plano
-COPY ./docker/supervisord/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-COPY ./docker/php/extra-php.ini "$PHP_INI_DIR/conf.d/99_extra.ini"
-# COPY ./docker/php/extra-php-fpm.conf /usr/local/etc/php-fpm.d/www.conf
-
+### Configurações do projeto
 WORKDIR $APP_DIR
-RUN cd $APP_DIR
-RUN chown www-data:www-data $APP_DIR
 
-COPY --chown=www-data:www-data . .
-RUN rm -rf vendor
-RUN composer install --no-interaction
+# Cria diretórios críticos e ajusta permissões ANTES de copiar o código
+RUN mkdir -p storage bootstrap/cache && \
+    chown -R ${WWWUSER}:${WWWGROUP} storage bootstrap/cache && \
+    chown -R ${WWWUSER}:${WWWGROUP} /var/www/storage && \
+    chmod -R 775 storage bootstrap/cache /var/www/storage
 
-### OCTANE
-# RUN composer require laravel/octane
-
-### NGINX
-RUN apt-get install nginx -y
-RUN rm -rf /etc/nginx/sites-enabled/* && rm -rf /etc/nginx/sites-available/*
-COPY ./docker/nginx/server.conf /etc/nginx/sites-enabled/default.conf
+# Copia arquivos de configuração
+COPY ./docker/supervisord/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY ./docker/php/extra-php.ini "$PHP_INI_DIR/conf.d/99_extra.ini"
+COPY ./docker/nginx/server.conf /etc/nginx/sites-enabled/default
 COPY ./docker/nginx/error.html /var/www/html/error.html
 
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN apt update -y && apt install nano git -y
+# Copia o código-fonte com permissões corretas
+COPY --chown=www-data:www-data . .
+
+# Configura o Git para aceitar o diretório (como root)
+RUN if [ -d ".git" ]; then \
+    git config --global --add safe.directory /var/www && \
+    git config --global --add safe.directory '*' && \
+    chown -R www-data:www-data /var/www; \
+    fi
+
+# Instala dependências como www-data
+USER www-data
+RUN composer install --ignore-platform-reqs --no-dev --no-interaction --prefer-dist --optimize-autoloader --no-progress
+
+# Limpeza final (como root)
+USER root
+RUN apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    chown -R www-data:www-data $APP_DIR && \
+    find $APP_DIR -type f -exec chmod 664 {} \; && \
+    find $APP_DIR -type d -exec chmod 775 {} \;
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
