@@ -66,4 +66,4 @@ volumes:
 
 networks:
   app-estacionamento:
-    external: true
+    driver: bridge
